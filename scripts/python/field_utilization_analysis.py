@@ -2,14 +2,25 @@
 """Salesforce Field Utilization Analysis
 
 Analyzes field population rates for any Salesforce object and generates
-a comprehensive Markdown report with descriptive statistics and Mermaid diagrams.
+a comprehensive Markdown report with descriptive statistics and Mermaid diagrams,
+and optionally a PDF copy of the same content.
+
 Requires: Salesforce CLI (sf) authenticated to the target org.
+
+PDF export (optional): python3 -m pip install -r scripts/python/requirements-analysis.txt
+  Mermaid in PDF: rasterized via mmdc / npx @mermaid-js/mermaid-cli when Node is available;
+  otherwise diagrams stay as text. Use --no-mermaid-pdf to skip. Open .md for native charts.
 """
 
+import argparse
 import json
+import re
+import shutil
 import subprocess
 import sys
 import os
+import tempfile
+from pathlib import Path
 import math
 import statistics as stats_mod
 from collections import Counter, defaultdict
@@ -230,6 +241,172 @@ def mermaid_bar(title, x_labels, y_label, values, y_max=100):
         f"    bar [{v_csv}]",
         "```",
     ])
+
+
+# ── PDF export (optional: markdown + fpdf2) ───────────────────────────────
+
+MERMAID_FENCE_RE = re.compile(r"```mermaid\s*\r?\n(.*?)```", re.DOTALL)
+
+
+def render_mermaid_to_png(diagram_source: str, out_png: Path) -> bool:
+    """Render Mermaid source to PNG using mmdc or npx @mermaid-js/mermaid-cli.
+
+    Returns True if out_png was written. Requires Node/npm for npx path.
+    """
+    diagram_source = diagram_source.strip()
+    if not diagram_source:
+        return False
+
+    fd, mmd_str = tempfile.mkstemp(suffix=".mmd", text=True)
+    mmd_file = Path(mmd_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(diagram_source)
+        out_png = Path(out_png)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+
+        def _run(cmd: list[str]) -> bool:
+            try:
+                r = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    cwd=str(out_png.parent),
+                )
+                return r.returncode == 0 and out_png.is_file() and out_png.stat().st_size > 0
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                return False
+
+        if _run(["mmdc", "-i", str(mmd_file), "-o", str(out_png), "-b", "white"]):
+            return True
+        if _run(
+            [
+                "npx",
+                "-y",
+                "@mermaid-js/mermaid-cli",
+                "-i",
+                str(mmd_file),
+                "-o",
+                str(out_png),
+                "-b",
+                "white",
+            ]
+        ):
+            return True
+        return False
+    finally:
+        if mmd_file.is_file():
+            mmd_file.unlink()
+
+
+def _inject_mermaid_images_for_pdf(md: str, tmpdir: Path, enabled: bool) -> tuple[str, int, int]:
+    """Replace ```mermaid blocks with markdown images. Returns (md, rendered_count, total_count)."""
+    total = len(MERMAID_FENCE_RE.findall(md))
+    if not enabled or total == 0:
+        return md, 0, total
+
+    state = {"i": 0, "rendered": 0}
+
+    def repl(match: re.Match) -> str:
+        code = match.group(1).strip()
+        state["i"] += 1
+        png = tmpdir / f"mermaid_{state['i']}.png"
+        if render_mermaid_to_png(code, png):
+            state["rendered"] += 1
+            return f"\n\n![Mermaid chart]({png.resolve().as_posix()})\n\n"
+        return match.group(0)
+
+    return MERMAID_FENCE_RE.sub(repl, md), state["rendered"], total
+
+
+def _simplify_markdown_links_for_pdf(md: str) -> str:
+    """Turn [label](url) into 'label (url)' so fpdf2 does not choke on <a> inside tables."""
+    return re.sub(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", md)
+
+
+def _normalize_markdown_for_pdf(md: str) -> str:
+    """Make Markdown friendlier for fpdf2's HTML renderer (core fonts, no <code> in <td>)."""
+    md = (
+        md.replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2026", "...")  # ellipsis (core fonts)
+    )
+    lines = []
+    for line in md.splitlines():
+        if "|" in line and "`" in line:
+            line = re.sub(r"`([^`]+)`", r"\1", line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def write_pdf_from_markdown(
+    markdown_source: str,
+    pdf_path: str,
+    *,
+    render_mermaid: bool = True,
+):
+    """Write a PDF from the same Markdown as the .md report.
+
+    Returns (success, error_message_or_none, info_note_or_none).
+
+    If ``render_mermaid`` is True, attempts to rasterize `` ```mermaid `` blocks
+    to PNG via ``mmdc`` or ``npx @mermaid-js/mermaid-cli`` (Node.js). Diagrams that
+    fail to render stay as code in the PDF.
+    """
+    try:
+        import markdown as md_lib
+        from fpdf import FPDF
+    except ImportError as e:
+        return False, (
+            f"PDF needs optional packages: python3 -m pip install -r scripts/python/requirements-analysis.txt ({e})"
+        ), None
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="sf_mermaid_pdf_"))
+    try:
+        md_work, m_ok, m_total = _inject_mermaid_images_for_pdf(
+            markdown_source, tmpdir, enabled=render_mermaid
+        )
+        md_prep = _normalize_markdown_for_pdf(md_work)
+        md_prep = _simplify_markdown_links_for_pdf(md_prep)
+        html = md_lib.markdown(
+            md_prep,
+            extensions=["tables", "fenced_code"],
+        )
+
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_margins(15, 15, 15)
+        pdf.add_page()
+        try:
+            pdf.write_html(html)
+        except Exception as e:
+            return False, f"PDF generation failed: {e}", None
+
+        try:
+            pdf.output(pdf_path)
+        except Exception as e:
+            return False, f"Could not write PDF: {e}", None
+
+        note = None
+        if m_total > 0:
+            if render_mermaid and m_ok == m_total:
+                note = f"Mermaid: rendered {m_ok}/{m_total} diagram(s) as images in PDF."
+            elif render_mermaid and m_ok > 0:
+                note = (
+                    f"Mermaid: rendered {m_ok}/{m_total} diagram(s); "
+                    f"{m_total - m_ok} left as text (install Node.js and run: "
+                    f"npm i -g @mermaid-js/mermaid-cli, or use npx)."
+                )
+            elif render_mermaid:
+                note = (
+                    "Mermaid: no diagrams rendered in PDF. Install Node.js, then "
+                    "`npm i -g @mermaid-js/mermaid-cli` (or ensure `npx` can run "
+                    "`@mermaid-js/mermaid-cli`), or use `--no-mermaid-pdf`."
+                )
+        return True, None, note
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ── Report generation ──────────────────────────────────────────────────────
@@ -473,31 +650,21 @@ def generate_report(object_name, object_label, total_records, fields, st):
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
-def main():
-    print("=" * 60)
-    print("  Salesforce Field Utilization Analysis")
-    print("=" * 60)
-    print()
+def parse_object_names(raw: str) -> list[str]:
+    """Split comma-separated API names; strip whitespace; drop empties."""
+    return [p.strip() for p in raw.split(",") if p.strip()]
 
-    try:
-        subprocess.run(["sf", "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: Salesforce CLI (sf) is not installed or not in PATH.")
-        sys.exit(1)
 
-    object_name = input("Enter the Object API Name (e.g. Account, Contact, Custom__c): ").strip()
-    if not object_name:
-        print("Error: no object name provided.")
-        sys.exit(1)
-
-    print(f"\nAnalyzing {object_name}...")
+def analyze_single_object(object_name: str, args) -> bool:
+    """Run full analysis for one object. Returns True on success, False on failure."""
+    print(f"Analyzing `{object_name}`...")
     print("-" * 40)
 
     try:
         describe = get_object_describe(object_name)
     except RuntimeError as e:
-        print(f"Error describing object: {e}")
-        sys.exit(1)
+        print(f"  Error describing object: {e}")
+        return False
 
     object_label = describe.get("label", object_name)
     all_fields = describe.get("fields", [])
@@ -506,8 +673,8 @@ def main():
     try:
         total_records = get_record_count(object_name)
     except RuntimeError as e:
-        print(f"Error counting records: {e}")
-        sys.exit(1)
+        print(f"  Error counting records: {e}")
+        return False
     print(f"  Found {total_records:,} records")
 
     aggregatable, filterable_non_agg, boolean_fields, skipped = classify_fields(all_fields)
@@ -567,7 +734,7 @@ def main():
     rates = [f["rate"] for f in fields if f["rate"] is not None]
     st = compute_statistics(rates)
 
-    print("\nGenerating report...")
+    print("\n  Generating report...")
     report = generate_report(object_name, object_label, total_records, fields, st)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -580,7 +747,86 @@ def main():
         fh.write(report)
 
     print(f"\n  Report saved to: {filepath}")
-    print("\nDone!")
+
+    if not args.no_pdf:
+        pdf_path = os.path.splitext(filepath)[0] + ".pdf"
+        ok, err, note = write_pdf_from_markdown(
+            report,
+            pdf_path,
+            render_mermaid=not args.no_mermaid_pdf,
+        )
+        if ok:
+            print(f"  PDF saved to: {pdf_path}")
+            if note:
+                print(f"  {note}")
+        else:
+            print(f"  PDF not created: {err}")
+
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Analyze Salesforce field utilization; write Markdown (+ optional PDF).",
+    )
+    parser.add_argument(
+        "-o",
+        "--object",
+        dest="object_name",
+        help="Salesforce object API name(s), comma-separated (e.g. Account,Contact,My__c). "
+        "If omitted, you will be prompted (comma-separated input allowed).",
+    )
+    parser.add_argument(
+        "--no-pdf",
+        action="store_true",
+        help="Skip PDF export (only write .md)",
+    )
+    parser.add_argument(
+        "--no-mermaid-pdf",
+        action="store_true",
+        help="Do not rasterize Mermaid diagrams in PDF (faster; charts as text)",
+    )
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("  Salesforce Field Utilization Analysis")
+    print("=" * 60)
+    print()
+
+    try:
+        subprocess.run(["sf", "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: Salesforce CLI (sf) is not installed or not in PATH.")
+        sys.exit(1)
+
+    raw = (args.object_name or "").strip()
+    if not raw:
+        raw = input(
+            "Enter object API name(s), comma-separated (e.g. Account, Contact, Custom__c): "
+        ).strip()
+    objects = parse_object_names(raw)
+    if not objects:
+        print("Error: no object name(s) provided.")
+        sys.exit(1)
+
+    if len(objects) > 1:
+        print(f"Batch mode: {len(objects)} object(s) — {', '.join(objects)}\n")
+
+    failures: list[str] = []
+    for idx, object_name in enumerate(objects, start=1):
+        if len(objects) > 1:
+            print(f"\n{'=' * 60}\n  [{idx}/{len(objects)}] `{object_name}`\n{'=' * 60}")
+        if not analyze_single_object(object_name, args):
+            failures.append(object_name)
+
+    print()
+    if failures:
+        print(f"Finished with errors — failed ({len(failures)}): {', '.join(failures)}")
+        sys.exit(1)
+    if len(objects) > 1:
+        print(f"Done — successfully processed {len(objects)} object(s).")
+    else:
+        print("Done!")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+# Optional dependencies for field_utilization_analysis.py (Markdown + PDF export)
+# Install: python3 -m pip install -r scripts/python/requirements-analysis.txt
+#
+# For Mermaid diagrams as images inside PDFs, also install Node.js and either:
+#   npm i -g @mermaid-js/mermaid-cli   (provides `mmdc`)
+# or rely on `npx -y @mermaid-js/mermaid-cli` (downloaded on first run).
+markdown>=3.5
+fpdf2>=2.7.0
