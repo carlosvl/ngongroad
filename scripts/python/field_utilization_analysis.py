@@ -201,11 +201,19 @@ def compute_statistics(rates):
 
 # ── Mermaid generators ─────────────────────────────────────────────────────
 
+def _mermaid_quote(s):
+    """Escape double quotes for use inside Mermaid double-quoted strings."""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def mermaid_pie(title, data):
-    lines = ["```mermaid", f"pie title {title}"]
+    """Mermaid pie syntax: title must be quoted if it contains spaces."""
+    t = _mermaid_quote(title)
+    lines = ["```mermaid", f'pie title "{t}"']
     for label, value in data.items():
         if value > 0:
-            lines.append(f'    "{label}" : {value}')
+            lbl = _mermaid_quote(label)
+            lines.append(f'    "{lbl}" : {value}')
     lines.append("```")
     return "\n".join(lines)
 

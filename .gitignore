@@ -42,9 +42,6 @@ $RECYCLE.BIN/
 # Local environment variables
 .env
 
-# Analysis reports (org-specific data)
-reports/
-
 # Python Salesforce Functions
 **/__pycache__/
 **/.venv/
